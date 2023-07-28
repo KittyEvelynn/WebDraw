@@ -1,0 +1,18 @@
+body,
+html {
+    background-color: rgb(36, 35, 35);
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    height: 100vh;
+}
+
+#viewport {
+    height: 100%;
+    width: 100%;
+}
+
+#canvas {
+    background-color: white;
+    image-rendering: crisp-edges;
+}
