@@ -10,12 +10,105 @@ let canvasLastY: number | null = 0
 // Variable to store key states
 let spaceDown = false
 
+class Layer {
+  public blendMode = "normal"
+  private framebuffer: WebGLFramebuffer
+  public texture: WebGLTexture
+  private gl: WebGL2RenderingContext | WebGLRenderingContext
+
+  constructor(gl: WebGL2RenderingContext | WebGLRenderingContext) {
+    this.gl = gl
+    this.framebuffer = gl.createFramebuffer()!
+    this.texture = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_2D, this.texture)
+
+    // Setup layer params TODO
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 400, 400, 0, gl.RGBA, gl.UNSIGNED_BYTE, null) // Change this to reflect the resolution
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+    //Creanup
+    gl.bindTexture(gl.TEXTURE_2D, null)
+  }
+
+  bindToFramebuffer(gl: WebGL2RenderingContext | WebGLRenderingContext) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer)
+    // Assign the texture to the frame buffer
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture, 0)
+  }
+}
+
 class Viewport {
+  // Shaders
+  private fragmentShader: any
+  private fragmentShaderSource = `#version 300 es
+  precision mediump float;
+  in vec2 frag_uv;
+  uniform vec2 size;
+  uniform sampler2D layerTexture;
+
+  out vec4 FragColor;
+  
+  void main() {
+    FragColor = texture(layerTexture, frag_uv);
+  }`
+
+  private normalBlendShader: any
+  private normalBlendShaderSource = `#version 300 es
+  precision mediump float;
+  in vec2 frag_uv;
+  uniform vec2 size;
+  uniform sampler2D topLayerTexture;
+  uniform sampler2D bottomLayerTexture;
+
+  out vec4 FragColor;
+
+  void main() {
+    // Sample colors from both textures at the same UV coordinate.
+    vec4 topColor = texture(topLayerTexture, frag_uv);
+    vec4 bottomColor = texture(bottomLayerTexture, frag_uv);
+
+    // Mix the colors based on their alpha values.
+    FragColor = mix(bottomColor, topColor, topColor.a);
+  }`
+
+  private brushShader: any
+  private brushShaderSource = `#version 300 es
+  precision mediump float;
+  in vec2 frag_uv;
+  uniform vec2 size;
+  uniform sampler2D layerTexture;
+
+  out vec4 FragColor;
+
+  void main() {
+    FragColor = vec4(frag_uv, 0.0, 1.0);
+  }`
+
+  private vertexShader: any
+  private vertexShaderSource = `#version 300 es
+  precision mediump float;
+  in vec2 position;
+  in vec2 uv;
+  out vec2 frag_uv;
+  
+  void main() {
+    gl_Position = vec4(position, 0, 1);
+    frag_uv = uv;
+  }`
+
   public domself: HTMLDivElement
   public domtranslate: HTMLDivElement
   public domzoom: HTMLDivElement
-  public canvas: HTMLCanvasElement
+  public domcanvas: HTMLCanvasElement
 
+  public layers: Layer[] = []
+  public strokeLayer: Layer | null = null
+  public selectedLayers: Layer[] = []
+
+  public gl: WebGL2RenderingContext | WebGLRenderingContext
 
   private _transform: { x: number, y: number } = { x: 0, y: 0 }
   get transform(): { x: number, y: number } {
@@ -29,7 +122,6 @@ class Viewport {
   translate(x: number, y: number) {
     this.setTransform(this._transform.x + x, this._transform.y + y)
   }
-
 
   private _scale: number = 1
   get scale(): number {
@@ -47,52 +139,239 @@ class Viewport {
   setCanvasSize(x: number, y: number) {
     this.canvasSize.x = x
     this.canvasSize.y = y
-    this.canvas.width = x
-    this.canvas.height = y
+    this.domcanvas.width = x
+    this.domcanvas.height = y
   }
 
   constructor(div: HTMLDivElement, sizeX: number = 400, sizeY: number = 400) {
+    // Create the dom stuff
     this.domself = div
     this.domtranslate = document.createElement('div')
     this.domtranslate.id = "translate"
     this.domzoom = document.createElement('div')
     this.domzoom.id = "zoom"
-    this.canvas = document.createElement('canvas')
-    this.canvas.id = "canvas"
+    this.domcanvas = document.createElement('canvas')
+    this.domcanvas.id = "canvas"
 
     // Assuming you want to append the created elements as children of _domself
     this.domself.appendChild(this.domtranslate)
     this.domtranslate.appendChild(this.domzoom)
-    this.domzoom.appendChild(this.canvas)
+    this.domzoom.appendChild(this.domcanvas)
 
     // Set the canvas properties
     this.setCanvasSize(sizeX, sizeY)
+
+    // Setup webgl stuff
+    this.gl = this.domcanvas.getContext("webgl2")!
+    this.initGLCanvas()
+
+    // Setup initial layer
+    this.layers.push(new Layer(this.gl))
   }
 
   center(): void {
     let x = this.domself.getBoundingClientRect().width
     let y = this.domself.getBoundingClientRect().height
-    this.setTransform(x / 2 - this.canvas.width / 2, y / 2 - this.canvas.height / 2)
+    this.setTransform(x / 2 - this.domcanvas.width / 2, y / 2 - this.domcanvas.height / 2)
+  }
+
+  initGLCanvas() {
+    let gl = this.gl
+
+    // Compile shaders
+    this.vertexShader = createShader(gl, gl.VERTEX_SHADER, this.vertexShaderSource)
+    this.fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, this.fragmentShaderSource)
+    this.brushShader = createShader(gl, gl.FRAGMENT_SHADER, this.brushShaderSource)
+    this.normalBlendShader = createShader(gl, gl.FRAGMENT_SHADER, this.normalBlendShaderSource)
+
+    // Initialize the empty canvas
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+  }
+
+  drawOn() {
+    let gl = this.gl
+
+    if (!this.strokeLayer) {
+      this.strokeLayer = new Layer(gl)
+    }
+
+    // Create the program
+    const program = createProgram(gl, this.vertexShader, this.brushShader)!// TODO make sure this doesnt get made every time
+    gl.useProgram(program)
+
+    // Set the layer's texture sampler
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.layers[0].texture)
+    const textureUniformLoc = gl.getUniformLocation(program, "layerTexture")
+    gl.uniform1i(textureUniformLoc, 0)
+
+    // Bind the output to the stroke layer
+    this.strokeLayer.bindToFramebuffer(gl)
+
+    // Render
+    this.render(program)
+
+    // Cleanup
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+  }
+
+  stopDrawing() {
+    if (this.strokeLayer) {
+      this.mergeLayers(this.strokeLayer, this.selectedLayers[0])
+      this.strokeLayer = null
+    }
+  }
+
+  updateCanvas() {
+
+  }
+
+  drawToCanvas(layer: Layer) {
+    let gl = this.gl
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    // Step 2: Set the viewport to match the canvas size.
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height)
+
+    // Draw to full screen quad
+    let program = createProgram(gl, this.vertexShader, this.fragmentShader)!
+    gl.useProgram(program)
+
+    // Set the layer's texture sampler
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, layer.texture)
+    const textureUniformLoc = gl.getUniformLocation(program, "layerTexture")
+    gl.uniform1i(textureUniformLoc, 0)
+
+    this.render(program)
+
+    // Cleanup
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+  }
+
+  /**
+  * Merges 2 layers onto a target or into the bottom layer
+  * @param {Layer} topLayer - Top layer
+  * @param {Layer} bottomLayer - Bottom layer that will be merged on
+  * @param {WebGLRenderbuffer | null} target - optional target output (defaults to removing the top layer and outputing into the bottom one)
+  */
+  mergeLayers(topLayer: Layer, bottomLayer: Layer, target: WebGLRenderbuffer | null = null) {// TODO use the right blend shader
+    let gl = this.gl
+
+    // Create the program
+    const program = createProgram(gl, this.vertexShader, this.normalBlendShader)!// TODO make sure this doesnt get made every time
+    gl.useProgram(program)
+
+    // Set the layer's texture sampler
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, topLayer.texture)
+    const topTextureUniformLoc = gl.getUniformLocation(program, "topLayerTexuture")
+    gl.uniform1i(topTextureUniformLoc, 0)
+
+    // Set the layer's texture sampler
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, bottomLayer.texture)
+    const bottomTextureUniformLoc = gl.getUniformLocation(program, "bottomLayerTexuture")
+    gl.uniform1i(bottomTextureUniformLoc, 1)
+
+    // Bind the output to either the target or the bottom layer
+    if (target)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target)
+    else
+      bottomLayer.bindToFramebuffer(gl)
+
+    // Render
+    this.render(program)
+
+    // Cleanup
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+
+    // Remove the top layer if we dont have a target
+    if (!target)
+      this.layers.splice(this.layers.indexOf(topLayer))
+  }
+
+  render(program: WebGLProgram) {
+    const gl = this.gl
+
+    const vertices = [
+      -1, -1,
+      1, -1,
+      -1, 1,
+      -1, 1,
+      1, -1,
+      1, 1,
+    ]
+    const vertexBuffer = gl.createBuffer()// TODO make sure this doesnt get recreated every time
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW)
+    const positionLocation = gl.getAttribLocation(program, "position")
+    gl.enableVertexAttribArray(positionLocation)
+    gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0)
+
+    // Setup uvs
+    const uvs = [
+      0.0, 0.0,
+      1.0, 0.0,
+      0.0, 1.0,
+      0.0, 1.0,
+      1.0, 0.0,
+      1.0, 1.0,
+    ]
+    const uvBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uvs), gl.STATIC_DRAW)
+    const uvLocation = gl.getAttribLocation(program, "uv")
+    gl.enableVertexAttribArray(uvLocation)
+    gl.vertexAttribPointer(uvLocation, 2, gl.FLOAT, false, 0, 0)
+
+    // Setup width and height
+    const sizeLocation = gl.getUniformLocation(program, "size")
+    gl.uniform2fv(sizeLocation, [this.domcanvas.width, this.domcanvas.height])
+
+    // // Clear the canvas
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    // Render
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+  }
+
+  debug(program: WebGLProgram) {
+    const gl = this.gl
+    const numAttribs = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES)
+    for (let ii = 0; ii < numAttribs; ++ii) {
+      const attribInfo = gl.getActiveAttrib(program, ii)!
+      const index = gl.getAttribLocation(program, attribInfo.name)
+      console.log(index, attribInfo.name);
+    }
+
+    const numUniforms = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+    for (let ii = 0; ii < numUniforms; ++ii) {
+      const uniformInfo = gl.getActiveUniform(program, ii)!;
+      const index = gl.getUniformLocation(program, uniformInfo.name);
+      console.log(`Uniform - index: ${index}, name: ${uniformInfo.name}, size: ${uniformInfo.size}, type: ${uniformInfo.type}`);
+    }
+
   }
 }
 
 // Initiate the canvas thingy
 let viewport = new Viewport(viewportdom)
 viewport.center()
-const ctx = viewport.canvas.getContext('2d')!
-ctx.translate(0.5, 0.5)
-ctx.imageSmoothingEnabled = false
-ctx.filter = "none"
 
-// Function to draw a line
-function drawLine(x1: number, y1: number, x2: number, y2: number) {
-  ctx.beginPath()
-  ctx.moveTo(x1, y1)
-  ctx.lineTo(x2, y2)
-  ctx.stroke()
-  ctx.closePath()
-  console.log(x1, x2, y1, y2)
-}
+viewport.drawOn()
+viewport.selectedLayers.push(viewport.layers[0])
+viewport.stopDrawing()
+viewport.drawToCanvas(viewport.selectedLayers[0])
 
 // Event listeners for mouse events
 document.addEventListener('mousedown', () => {
@@ -127,8 +406,8 @@ viewport.domself.addEventListener('mousemove', (e) => {
   lastX = currentX
   lastY = currentY
 })
-
-viewport.canvas.addEventListener('mousemove', (e) => {
+/*
+viewport.domcanvas.addEventListener('mousemove', (e) => {
   const currentX = e.offsetX
   const currentY = e.offsetY
   if (isDrawing) {
@@ -138,3 +417,30 @@ viewport.canvas.addEventListener('mousemove', (e) => {
   canvasLastX = currentX
   canvasLastY = currentY
 })
+*/
+// Helper function to compile shaders
+function createShader(gl: WebGL2RenderingContext | WebGLRenderingContext, type: number, source: string) {
+  const shader = gl.createShader(type)!
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.error('Shader compilation error:', gl.getShaderInfoLog(shader))
+    gl.deleteShader(shader)
+    return null
+  }
+  return shader;
+}
+
+// Helper function to create a program and link shaders
+function createProgram(gl: WebGL2RenderingContext | WebGLRenderingContext, vertexShader: WebGLShader, fragmentShader: WebGLShader) {
+  const program = gl.createProgram()!
+  gl.attachShader(program, vertexShader)
+  gl.attachShader(program, fragmentShader)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error('Program linking error:', gl.getProgramInfoLog(program))
+    gl.deleteProgram(program)
+    return null
+  }
+  return program
+}
