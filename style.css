@@ -13,6 +13,5 @@ html {
 }
 
 #canvas {
-    background-color: white;
-    image-rendering: crisp-edges;
+    background-color: gray;
 }
